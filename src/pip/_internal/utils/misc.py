@@ -15,7 +15,9 @@ import posixpath
 import shutil
 import stat
 import sys
+import tempfile
 from collections import deque
+from functools import partial
 
 from pip._vendor import pkg_resources
 # NOTE: retrying is not annotated in typeshed as on 2017-07-17, which is
@@ -131,16 +133,20 @@ def get_prog():
 
 # Retry every half second for up to 3 seconds
 @retry(stop_max_delay=3000, wait_fixed=500)
-def rmtree(dir, ignore_errors=False):
+def rmtree(dir, ignore_errors=False, trashdir=None):
     # type: (str, bool) -> None
+    if trashdir is None:
+        trashdir = os.path.dirname(dir)
+
     shutil.rmtree(dir, ignore_errors=ignore_errors,
-                  onerror=rmtree_errorhandler)
+                  onerror=partial(rmtree_errorhandler, trashdir=trashdir))
 
 
-def rmtree_errorhandler(func, path, exc_info):
+def rmtree_errorhandler(func, path, exc_info, **kwargs):
     """On Windows, the files in .svn are read-only, so when rmtree() tries to
     remove them, an exception is thrown.  We catch that here, remove the
     read-only attribute, and hopefully continue without problems."""
+    trashdir=kwargs.pop("trashdir", None)  # type: Optional[str]
     try:
         has_attr_readonly = not (os.stat(path).st_mode & stat.S_IWRITE)
     except (IOError, OSError):
@@ -153,8 +159,31 @@ def rmtree_errorhandler(func, path, exc_info):
         # use the original function to repeat the operation
         func(path)
         return
-    else:
-        raise
+    if exc_info is None:
+        exc_info = sys.exc_info()
+    exc_val = exc_info[1]
+    if sys.platform == "win32" and isinstance(exc_val, OSError) \
+            and exc_val.errno == errno.EACCES \
+            and func == os.unlink and trashdir is not None:
+        # On win32 a loaded .exe, .dll, ... cannot be unlinked, but it can be
+        # renamed and scheduled for removal at next reboot. Move and rename to
+        # a unique filename in `trashdir` (must be on the same volume as
+        # `path`)
+        trashname = tempfile.mktemp(
+            suffix=".pip-trash", prefix=".{}-".format(os.path.basename(path)),
+            dir=trashdir)
+        try:
+            logging.debug("os.rename(%r, %r)", path, trashname)
+            os.rename(path, trashname)
+        except OSError:
+            pass
+        else:
+            logging.debug("MoveFileEx(%r, None, MOVEFILE_DELAY_UNTIL_REBOOT)",
+                          trashname)
+            _winapi.MoveFileEx(trashname, None,
+                               _winapi.MOVEFILE_DELAY_UNTIL_REBOOT)
+            return
+    raise
 
 
 def path_to_display(path):
@@ -879,3 +908,45 @@ def hash_file(path, blocksize=1 << 20):
             length += len(block)
             h.update(block)
     return (h, length)  # type: ignore
+
+
+class _winapi(object):
+    # minimum ctypes winapi to expose MoveFileExW
+    MOVEFILE_REPLACE_EXISTING = 0x1
+    MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+
+    _MoveFileEx = None
+
+    @classmethod
+    def MoveFileEx(cls, old, new, flags):
+        # type: (str, Optional[str], int) -> None
+        import ctypes.util
+        from ctypes import wintypes
+        if cls._MoveFileEx is None:
+            kernel32 = ctypes.WinDLL(
+                ctypes.util.find_library("kernel32"), use_last_error=True
+            )
+            # https://msdn.microsoft.com/en-us/library/windows/desktop/aa365240(v=vs.85).aspx
+            _MoveFileExW = kernel32.MoveFileExW
+            _MoveFileExW.argtypes = [
+                wintypes.LPCWSTR,  # lpExistingFileName
+                wintypes.LPCWSTR,  # lpNewFileName
+                wintypes.DWORD  # dwFlags
+            ]
+            _MoveFileExW.restype = wintypes.BOOL
+
+            cls._MoveFileEx = _MoveFileExW
+            cls.WinError = ctypes.WinError
+        if not cls._MoveFileExW(old, new, flags):
+            raise ctypes.WinError()
+
+
+def os_replace_win32(old, new):
+    # type: (str, str) -> None
+    _winapi.MoveFileEx(old, new, _winapi.MOVEFILE_REPLACE_EXISTING)
+
+
+if sys.platform == "win32" and sys.version_info < (3, 3):
+    os_replace = os_replace_win32
+else:
+    os_replace = os.replace

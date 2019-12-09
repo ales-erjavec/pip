@@ -115,12 +115,12 @@ class TempDirectory(object):
         logger.debug("Created temporary directory: {}".format(path))
         return path
 
-    def cleanup(self):
+    def cleanup(self, trashdir=None):
         """Remove the temporary directory created and reset state
         """
         self._deleted = True
         if os.path.exists(self._path):
-            rmtree(self._path)
+            rmtree(self._path, trashdir=trashdir)
 
 
 class AdjacentTempDirectory(TempDirectory):

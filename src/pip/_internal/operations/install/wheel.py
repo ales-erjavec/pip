@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import sys
+import tempfile
 import warnings
 from base64 import urlsafe_b64encode
 from email.parser import Parser
@@ -27,7 +28,8 @@ from pip._vendor.six import StringIO
 
 from pip._internal.exceptions import InstallationError, UnsupportedWheel
 from pip._internal.locations import get_major_minor_version
-from pip._internal.utils.misc import captured_stdout, ensure_dir, hash_file
+from pip._internal.utils.misc import captured_stdout, ensure_dir, hash_file, \
+    os_replace
 from pip._internal.utils.typing import MYPY_CHECK_RUNNING
 
 if MYPY_CHECK_RUNNING:
@@ -399,23 +401,24 @@ def install_unpacked_wheel(
                 # uninstalled.
                 ensure_dir(destdir)
 
-                # copyfile (called below) truncates the destination if it
-                # exists and then writes the new contents. This is fine in most
-                # cases, but can cause a segfault if pip has loaded a shared
-                # object (e.g. from pyopenssl through its vendored urllib3)
-                # Since the shared object is mmap'd an attempt to call a
-                # symbol in it will then cause a segfault. Unlinking the file
-                # allows writing of new contents while allowing the process to
-                # continue to use the old copy.
-                if os.path.exists(destfile):
-                    os.unlink(destfile)
-
-                # We use copyfile (not move, copy, or copy2) to be extra sure
-                # that we are not moving directories over (copyfile fails for
-                # directories) as well as to ensure that we are not copying
-                # over any metadata because we want more control over what
-                # metadata we actually copy over.
-                shutil.copyfile(srcfile, destfile)
+                # # copyfile (called below) truncates the destination if it
+                # # exists and then writes the new contents. This is fine in most
+                # # cases, but can cause a segfault if pip has loaded a shared
+                # # object (e.g. from pyopenssl through its vendored urllib3)
+                # # Since the shared object is mmap'd an attempt to call a
+                # # symbol in it will then cause a segfault. Unlinking the file
+                # # allows writing of new contents while allowing the process to
+                # # continue to use the old copy.
+                # if os.path.exists(destfile):
+                #     os.unlink(destfile)
+                #
+                # # We use copyfile (not move, copy, or copy2) to be extra sure
+                # # that we are not moving directories over (copyfile fails for
+                # # directories) as well as to ensure that we are not copying
+                # # over any metadata because we want more control over what
+                # # metadata we actually copy over.
+                # shutil.copyfile(srcfile, destfile)
+                copy_file_safe(srcfile, destfile)
 
                 # Copy over the metadata for the file, currently this only
                 # includes the atime and mtime.
@@ -663,3 +666,42 @@ def check_compatibility(version, name):
             'Installing from a newer Wheel-Version (%s)',
             '.'.join(map(str, version)),
         )
+
+
+def copy_file_safe(src, dst):
+    # type: (str, str) -> None
+    """
+    Copy file `src` to `dst` replacing `dst` if it exists.
+
+    `src` is first copied to a tmp file in the same directory as `dst` and
+    then moved in place using `os.replace`.
+
+    :param str src: The source filename.
+    :param str dst: The destination filename.
+    """
+    dstname, dstdir = os.path.split(dst)
+    fd = -1
+    tmpname = None  # type: Optional[str]
+    try:
+        # create a temp file in the dest dir
+        fd, tmpname = tempfile.mkstemp(
+            prefix=dstname, suffix=".temp", dir=dstdir)
+        os.chmod(tmpname, 0o644)
+        with os.fdopen(fd, "wb") as tmpdst:
+            fd = -1  # tmpdst owns it now
+            with open(src, "rb") as fsrc:
+                shutil.copyfileobj(fsrc, tmpdst)
+                shutil.copymode(src, tmpname)
+        os_replace(tmpname, dst)
+        tmpname = None
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmpname is not None:
+            try:
+                os.remove(tmpname)
+            except OSError:
+                pass
